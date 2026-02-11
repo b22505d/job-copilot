@@ -1,0 +1,46 @@
+{
+  "personal": {
+    "first_name": "Avery",
+    "last_name": "Jordan",
+    "email": "avery.jordan@example.com",
+    "phone": "+1-415-555-0123",
+    "location": "San Francisco, CA"
+  },
+  "links": {
+    "linkedin": "https://www.linkedin.com/in/avery-jordan",
+    "github": "https://github.com/averyjordan",
+    "portfolio": "https://averyjordan.dev"
+  },
+  "work_auth": {
+    "need_sponsorship": false,
+    "work_authorization": "US Citizen"
+  },
+  "experience": [
+    {
+      "company": "Acme Corp",
+      "title": "Software Engineer",
+      "start_date": "2022-06",
+      "end_date": "2025-01",
+      "location": "San Francisco, CA",
+      "summary": "Built internal automation tooling and application workflows."
+    }
+  ],
+  "education": [
+    {
+      "school": "State University",
+      "degree": "B.S. Computer Science",
+      "start_date": "2018-08",
+      "end_date": "2022-05"
+    }
+  ],
+  "skills": [
+    "Python",
+    "FastAPI",
+    "TypeScript",
+    "Chrome Extensions"
+  ],
+  "documents": {
+    "resume_url": "",
+    "cover_letter_url": ""
+  }
+}

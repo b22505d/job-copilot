@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Job Copilot</title>
+    <style>
+      body {
+        width: 320px;
+        padding: 12px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      h1 {
+        font-size: 15px;
+        margin: 0 0 10px;
+      }
+
+      label {
+        display: block;
+        font-size: 12px;
+        margin-bottom: 4px;
+      }
+
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        margin-bottom: 8px;
+        padding: 8px;
+      }
+
+      button {
+        width: 100%;
+        padding: 9px;
+        border: 0;
+        border-radius: 6px;
+        background: #0c6cf2;
+        color: #fff;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+
+      #status {
+        margin-top: 10px;
+        font-size: 12px;
+        white-space: pre-line;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Job Copilot Autofill</h1>
+    <label for="apiBaseUrl">Backend URL</label>
+    <input id="apiBaseUrl" value="http://127.0.0.1:8000" />
+    <button id="autofillButton">Autofill Current Tab</button>
+    <div id="status"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

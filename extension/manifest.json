@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Job Copilot Autofill MVP",
+  "version": "0.1.0",
+  "description": "Autofill Greenhouse applications from a canonical profile.",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab", "tabs", "storage"],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*",
+    "https://*.greenhouse.io/*",
+    "http://*.greenhouse.io/*",
+    "https://boards.greenhouse.io/*",
+    "http://boards.greenhouse.io/*",
+    "https://job-boards.greenhouse.io/*",
+    "http://job-boards.greenhouse.io/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.greenhouse.io/*",
+        "http://*.greenhouse.io/*",
+        "https://boards.greenhouse.io/*",
+        "http://boards.greenhouse.io/*",
+        "https://job-boards.greenhouse.io/*",
+        "http://job-boards.greenhouse.io/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
