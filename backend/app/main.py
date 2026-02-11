@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -91,6 +94,40 @@ class JobEvent(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class AiFieldQuestion(BaseModel):
+    field_id: str
+    label: str
+    field_type: str
+    required: bool = False
+    options: list[str] = Field(default_factory=list)
+    current_value: Any = None
+
+
+class AiFieldAnswer(BaseModel):
+    field_id: str
+    value: Any = ""
+    confidence: float = 0.0
+    reason: str = ""
+    source: str = "inferred"
+
+
+class AiAnswerRequest(BaseModel):
+    site: str
+    job_url: str
+    job_title: str = ""
+    company: str = ""
+    job_description: str = ""
+    fields: list[AiFieldQuestion] = Field(default_factory=list)
+    profile: Optional[Profile] = None
+
+
+class AiAnswerResponse(BaseModel):
+    answers: list[AiFieldAnswer] = Field(default_factory=list)
+    used_llm: bool = False
+    model: str = ""
+    message: str = ""
+
+
 app = FastAPI(title="Job Copilot MVP API", version="0.1.0")
 
 app.add_middleware(
@@ -112,6 +149,162 @@ def load_profile() -> Profile:
 def save_profile(profile: Profile) -> None:
     with PROFILE_PATH.open("w", encoding="utf-8") as file:
         json.dump(profile.model_dump(mode="json"), file, indent=2)
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", text.lower())).strip()
+
+
+def clamp_confidence(score: float) -> float:
+    return max(0.0, min(1.0, score))
+
+
+def parse_json_from_llm(content: str) -> dict[str, Any]:
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
+
+
+def pick_best_option(options: list[str], terms: list[str]) -> Optional[str]:
+    normalized_options = [(option, normalize_text(option)) for option in options if option.strip()]
+    for term in terms:
+        normalized_term = normalize_text(term)
+        for option, normalized_option in normalized_options:
+            if normalized_term and normalized_term in normalized_option:
+                return option
+    return None
+
+
+def build_heuristic_answers(profile: Profile, fields: list[AiFieldQuestion]) -> list[AiFieldAnswer]:
+    answers: list[AiFieldAnswer] = []
+
+    for field in fields:
+        label = normalize_text(field.label)
+        options = field.options
+        value: Any = None
+        confidence = 0.0
+        reason = ""
+
+        if "sponsor" in label:
+            sponsorship_needed = bool(profile.work_auth.need_sponsorship)
+            preferred = "Yes" if sponsorship_needed else "No"
+            selected = pick_best_option(options, [preferred])
+            value = selected or preferred
+            confidence = 0.82
+            reason = "Derived from profile.work_auth.need_sponsorship."
+        elif "authorized to work" in label or "work authorization" in label:
+            authorization = (profile.work_auth.work_authorization or "").strip()
+            selected = pick_best_option(options, [authorization, "Yes"])
+            value = selected or authorization or "Yes"
+            confidence = 0.78
+            reason = "Derived from profile.work_auth.work_authorization."
+        elif "linkedin" in label and profile.links.linkedin:
+            value = profile.links.linkedin
+            confidence = 0.9
+            reason = "Copied from profile.links.linkedin."
+        elif "github" in label and profile.links.github:
+            value = profile.links.github
+            confidence = 0.9
+            reason = "Copied from profile.links.github."
+        elif "portfolio" in label and profile.links.portfolio:
+            value = profile.links.portfolio
+            confidence = 0.9
+            reason = "Copied from profile.links.portfolio."
+        elif "location" in label and profile.personal.location:
+            value = profile.personal.location
+            confidence = 0.82
+            reason = "Copied from profile.personal.location."
+
+        if value is None:
+            continue
+
+        answers.append(
+            AiFieldAnswer(
+                field_id=field.field_id,
+                value=value,
+                confidence=clamp_confidence(confidence),
+                reason=reason,
+                source="profile",
+            )
+        )
+
+    return answers
+
+
+def call_openai_for_field_answers(request: AiAnswerRequest, profile: Profile) -> tuple[list[AiFieldAnswer], str]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return [], ""
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    api_base = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
+    url = f"{api_base}/chat/completions"
+
+    system_prompt = (
+        "You are a job application assistant. Return JSON only with this shape: "
+        "{\"answers\":[{\"field_id\":\"...\",\"value\":...,\"confidence\":0.0-1.0,"
+        "\"reason\":\"...\",\"source\":\"resume|job_description|profile|inferred\"}]}. "
+        "Rules: do not invent facts, prefer profile data, choose option values exactly from provided options, "
+        "and keep confidence below 0.75 when uncertain."
+    )
+    user_payload = {
+        "profile": profile.model_dump(mode="json"),
+        "job": {
+            "site": request.site,
+            "job_url": request.job_url,
+            "job_title": request.job_title,
+            "company": request.company,
+            "job_description": request.job_description[:12000],
+        },
+        "fields": [field.model_dump(mode="json") for field in request.fields],
+    }
+    body = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload)},
+        ],
+    }
+    request_data = json.dumps(body).encode("utf-8")
+    http_request = urllib.request.Request(
+        url,
+        data=request_data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(http_request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"OpenAI API error ({exc.code}): {details[:500]}") from exc
+    except Exception as exc:  # pragma: no cover - network errors are environment-specific
+        raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+
+    try:
+        content = payload["choices"][0]["message"]["content"]
+        parsed = parse_json_from_llm(content)
+    except Exception as exc:
+        raise RuntimeError(f"Could not parse OpenAI response: {exc}") from exc
+
+    output: list[AiFieldAnswer] = []
+    for item in parsed.get("answers", []):
+        try:
+            answer = AiFieldAnswer.model_validate(item)
+            answer.confidence = clamp_confidence(float(answer.confidence))
+            output.append(answer)
+        except Exception:
+            continue
+
+    return output, model
 
 
 profile_store = load_profile()
@@ -162,6 +355,38 @@ def create_audit_event(event: AuditEvent) -> dict[str, Any]:
     }
     audit_events.append(record)
     return {"id": event_id, "status": "recorded"}
+
+
+@app.post("/ai/answer-fields", response_model=AiAnswerResponse)
+def ai_answer_fields(request: AiAnswerRequest) -> AiAnswerResponse:
+    profile = request.profile or profile_store
+    heuristic_answers = build_heuristic_answers(profile, request.fields)
+    answer_map: dict[str, AiFieldAnswer] = {answer.field_id: answer for answer in heuristic_answers}
+
+    used_llm = False
+    model_name = ""
+    message = ""
+
+    try:
+        llm_answers, model_name = call_openai_for_field_answers(request, profile)
+        if llm_answers:
+            used_llm = True
+        for answer in llm_answers:
+            existing = answer_map.get(answer.field_id)
+            if not existing or answer.confidence >= existing.confidence:
+                answer_map[answer.field_id] = answer
+    except RuntimeError as exc:
+        message = str(exc)
+
+    if not os.getenv("OPENAI_API_KEY", "").strip():
+        message = "OPENAI_API_KEY not set. Returned heuristic answers only."
+
+    return AiAnswerResponse(
+        answers=list(answer_map.values()),
+        used_llm=used_llm,
+        model=model_name,
+        message=message,
+    )
 
 
 @app.post("/jobs/save")

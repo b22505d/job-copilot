@@ -1,4 +1,5 @@
 const LOW_CONFIDENCE_THRESHOLD = 0.65;
+const AI_FILL_CONFIDENCE_THRESHOLD = 0.72;
 const SUMMARY_ID = "job-copilot-autofill-summary";
 const STYLE_ID = "job-copilot-autofill-style";
 
@@ -50,7 +51,26 @@ function textFromNode(node) {
   return normalize(node?.textContent || "");
 }
 
-function getCandidateText(input) {
+function dispatchFieldEvents(element) {
+  element.dispatchEvent(new Event("input", { bubbles: true }));
+  element.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function getOptionLabelFromInput(input) {
+  if (input.labels?.length) {
+    return normalize(input.labels[0].textContent || "");
+  }
+
+  const parentLabel = input.closest("label");
+  if (parentLabel) {
+    return normalize(parentLabel.textContent || "");
+  }
+
+  const siblingText = input.parentElement?.textContent || "";
+  return normalize(siblingText);
+}
+
+function getCandidateTextFromElement(input) {
   const candidates = [];
 
   if (input.labels?.length) {
@@ -76,7 +96,7 @@ function getCandidateText(input) {
     candidates.push(parentText);
   }
 
-  const fieldContainer = input.closest(".field, .application-field, .input-wrapper, .form-field");
+  const fieldContainer = input.closest(".field, .application-field, .input-wrapper, .form-field, fieldset");
   if (fieldContainer) {
     const heading = fieldContainer.querySelector("label, legend, h3, h4, p");
     if (heading) {
@@ -86,6 +106,114 @@ function getCandidateText(input) {
 
   const normalized = candidates.map(normalize).filter(Boolean);
   return Array.from(new Set(normalized)).join(" ");
+}
+
+function makeFieldIdFactory() {
+  const counts = new Map();
+  return (prefix, raw) => {
+    const basePart = normalize(raw || "field").replace(/\s+/g, "_") || "field";
+    const base = `${prefix}:${basePart}`;
+    const existing = counts.get(base) || 0;
+    counts.set(base, existing + 1);
+    return existing === 0 ? base : `${base}_${existing + 1}`;
+  };
+}
+
+function isRequiredField(element) {
+  return (
+    !!element.required ||
+    element.getAttribute("aria-required") === "true" ||
+    normalize(element.closest("label, .field, .application-field, fieldset")?.textContent || "").includes("required")
+  );
+}
+
+function extractFieldCandidates() {
+  const nextFieldId = makeFieldIdFactory();
+  const candidates = [];
+
+  const textLike = Array.from(document.querySelectorAll("input, textarea, select"));
+  for (const element of textLike) {
+    const tag = element.tagName.toLowerCase();
+    const type = (element.getAttribute("type") || "text").toLowerCase();
+
+    if (tag === "input" && ["hidden", "submit", "button", "password", "file", "radio", "checkbox"].includes(type)) {
+      continue;
+    }
+
+    const fieldType = tag === "textarea" ? "textarea" : tag === "select" ? "select" : "text";
+    const labelText = getCandidateTextFromElement(element);
+    const rawId = element.id || element.name || labelText;
+
+    const options =
+      fieldType === "select"
+        ? Array.from(element.options || [])
+            .map((opt) => (opt.textContent || "").trim())
+            .filter(Boolean)
+        : [];
+
+    candidates.push({
+      id: nextFieldId(fieldType, rawId),
+      fieldType,
+      labelText,
+      options,
+      required: isRequiredField(element),
+      elements: [element]
+    });
+  }
+
+  const radioInputs = Array.from(document.querySelectorAll("input[type='radio']"));
+  const radioGroups = new Map();
+  for (const input of radioInputs) {
+    const key = input.name || input.id || getCandidateTextFromElement(input) || "radio";
+    if (!radioGroups.has(key)) {
+      radioGroups.set(key, []);
+    }
+    radioGroups.get(key).push(input);
+  }
+
+  for (const [groupKey, inputs] of radioGroups.entries()) {
+    const labelText = getCandidateTextFromElement(inputs[0]);
+    const options = inputs
+      .map((input) => getOptionLabelFromInput(input) || normalize(input.value || ""))
+      .filter(Boolean);
+
+    candidates.push({
+      id: nextFieldId("radio", groupKey),
+      fieldType: "radio",
+      labelText,
+      options,
+      required: inputs.some((input) => isRequiredField(input)),
+      elements: inputs
+    });
+  }
+
+  const checkboxInputs = Array.from(document.querySelectorAll("input[type='checkbox']"));
+  const checkboxGroups = new Map();
+  for (const input of checkboxInputs) {
+    const key = input.name || input.id || `checkbox_${checkboxGroups.size + 1}`;
+    if (!checkboxGroups.has(key)) {
+      checkboxGroups.set(key, []);
+    }
+    checkboxGroups.get(key).push(input);
+  }
+
+  for (const [groupKey, inputs] of checkboxGroups.entries()) {
+    const labelText = getCandidateTextFromElement(inputs[0]);
+    const options = inputs
+      .map((input) => getOptionLabelFromInput(input) || normalize(input.value || ""))
+      .filter(Boolean);
+
+    candidates.push({
+      id: nextFieldId("checkbox", groupKey),
+      fieldType: "checkbox",
+      labelText,
+      options,
+      required: inputs.some((input) => isRequiredField(input)),
+      elements: inputs
+    });
+  }
+
+  return candidates;
 }
 
 function mapFieldFromText(haystack) {
@@ -123,26 +251,173 @@ function getProfileValue(profile, key) {
   return (reader(profile) || "").toString().trim();
 }
 
-function fillInput(input, value) {
-  if (!value) {
+function findBestOptionMatch(options, value) {
+  const normalizedValue = normalize(Array.isArray(value) ? value.join(" ") : String(value || ""));
+  if (!normalizedValue) {
+    return null;
+  }
+
+  for (const option of options) {
+    const optionLabel = normalize(option.label || option.text || option.value || "");
+    const optionValue = normalize(option.value || "");
+    if (
+      optionLabel === normalizedValue ||
+      optionValue === normalizedValue ||
+      optionLabel.includes(normalizedValue) ||
+      normalizedValue.includes(optionLabel)
+    ) {
+      return option;
+    }
+  }
+
+  return null;
+}
+
+function fillCandidate(candidate, value) {
+  if (value === null || value === undefined || value === "") {
     return { status: "missing-profile-value" };
   }
 
-  if (input.disabled || input.readOnly) {
-    return { status: "not-editable" };
+  const primary = candidate.elements[0];
+  if (!primary) {
+    return { status: "missing-element" };
   }
 
-  if ((input.value || "").trim()) {
-    return { status: "already-populated" };
+  if (candidate.fieldType === "text" || candidate.fieldType === "textarea") {
+    if (primary.disabled || primary.readOnly) {
+      return { status: "not-editable" };
+    }
+    if ((primary.value || "").trim()) {
+      return { status: "already-populated" };
+    }
+    primary.focus();
+    primary.value = String(value);
+    dispatchFieldEvents(primary);
+    primary.blur();
+    return { status: "filled" };
   }
 
-  input.focus();
-  input.value = value;
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-  input.dispatchEvent(new Event("change", { bubbles: true }));
-  input.blur();
+  if (candidate.fieldType === "select") {
+    if (primary.disabled) {
+      return { status: "not-editable" };
+    }
 
-  return { status: "filled" };
+    const options = Array.from(primary.options || []);
+    const matched = findBestOptionMatch(options, value);
+    if (!matched) {
+      return { status: "option-not-found" };
+    }
+
+    primary.value = matched.value;
+    dispatchFieldEvents(primary);
+    return { status: "filled" };
+  }
+
+  if (candidate.fieldType === "radio") {
+    const options = candidate.elements.map((input) => ({
+      input,
+      value: input.value,
+      label: getOptionLabelFromInput(input)
+    }));
+    const matched = findBestOptionMatch(options, value);
+    if (!matched) {
+      return { status: "option-not-found" };
+    }
+
+    if (!matched.input.checked) {
+      matched.input.click();
+      dispatchFieldEvents(matched.input);
+    }
+    return { status: "filled" };
+  }
+
+  if (candidate.fieldType === "checkbox") {
+    const inputs = candidate.elements;
+
+    if (inputs.length === 1 && typeof value === "boolean") {
+      const input = inputs[0];
+      if (input.checked !== value) {
+        input.checked = value;
+        dispatchFieldEvents(input);
+      }
+      return { status: "filled" };
+    }
+
+    if (inputs.length === 1 && typeof value === "string") {
+      const normalized = normalize(value);
+      const shouldCheck = ["yes", "true", "1", "checked"].some((token) => normalized.includes(token));
+      const input = inputs[0];
+      if (input.checked !== shouldCheck) {
+        input.checked = shouldCheck;
+        dispatchFieldEvents(input);
+      }
+      return { status: "filled" };
+    }
+
+    const targetValues = Array.isArray(value) ? value : [value];
+    let matchedAny = false;
+
+    for (const target of targetValues) {
+      const matched = findBestOptionMatch(
+        inputs.map((input) => ({
+          input,
+          value: input.value,
+          label: getOptionLabelFromInput(input)
+        })),
+        target
+      );
+      if (matched) {
+        matched.input.checked = true;
+        dispatchFieldEvents(matched.input);
+        matchedAny = true;
+      }
+    }
+
+    return matchedAny ? { status: "filled" } : { status: "option-not-found" };
+  }
+
+  return { status: "unsupported-field-type" };
+}
+
+function getCurrentCandidateValue(candidate) {
+  const primary = candidate.elements[0];
+  if (!primary) {
+    return "";
+  }
+
+  if (candidate.fieldType === "text" || candidate.fieldType === "textarea") {
+    return (primary.value || "").trim();
+  }
+
+  if (candidate.fieldType === "select") {
+    return (primary.value || "").trim();
+  }
+
+  if (candidate.fieldType === "radio") {
+    const selected = candidate.elements.find((input) => input.checked);
+    return selected ? selected.value : "";
+  }
+
+  if (candidate.fieldType === "checkbox") {
+    const checked = candidate.elements.filter((input) => input.checked).map((input) => input.value || "true");
+    return checked;
+  }
+
+  return "";
+}
+
+function isCandidateFilled(candidate) {
+  const value = getCurrentCandidateValue(candidate);
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  return Boolean(String(value || "").trim());
+}
+
+function highlightCandidate(candidate) {
+  for (const element of candidate.elements) {
+    element.classList.add("job-copilot-low-confidence");
+  }
 }
 
 function ensureStyles() {
@@ -163,7 +438,7 @@ function ensureStyles() {
       position: fixed;
       top: 12px;
       right: 12px;
-      width: 320px;
+      width: 340px;
       z-index: 2147483647;
       background: #101624;
       color: #f7f9fc;
@@ -198,7 +473,9 @@ function renderSummary(summary) {
   panel.id = SUMMARY_ID;
 
   const items = [
-    `filled: ${summary.filledCount}`,
+    `deterministic filled: ${summary.filledRuleCount}`,
+    `ai filled: ${summary.filledAiCount}`,
+    `total filled: ${summary.filledCount}`,
     `skipped: ${summary.skippedCount}`,
     `low confidence: ${summary.lowConfidenceCount}`,
     `missing profile values: ${summary.missingValues.length}`,
@@ -213,15 +490,41 @@ function renderSummary(summary) {
   document.body.appendChild(panel);
 }
 
-function getFillableInputs() {
-  const inputs = Array.from(document.querySelectorAll("input, textarea"));
-  return inputs.filter((input) => {
-    const type = (input.getAttribute("type") || "text").toLowerCase();
-    if (["hidden", "submit", "button", "checkbox", "radio", "file", "password"].includes(type)) {
-      return false;
+function extractJobDescriptionText() {
+  const selectors = [
+    ".opening",
+    ".job-post",
+    ".job-description",
+    "[data-qa='job-description']",
+    "#content"
+  ];
+
+  for (const selector of selectors) {
+    const node = document.querySelector(selector);
+    const text = (node?.innerText || "").trim();
+    if (text.length > 400) {
+      return text.slice(0, 12000);
     }
-    return true;
-  });
+  }
+
+  return (document.body?.innerText || "").slice(0, 12000);
+}
+
+function extractJobTitle() {
+  const explicit = document.querySelector("h1");
+  if (explicit?.textContent) {
+    return explicit.textContent.trim();
+  }
+  return (document.title || "").split("|")[0].trim();
+}
+
+function extractCompanyName() {
+  const title = document.title || "";
+  const parts = title.split("|").map((part) => part.trim()).filter(Boolean);
+  if (parts.length > 1) {
+    return parts[parts.length - 1];
+  }
+  return "";
 }
 
 async function fetchProfile(apiBaseUrl) {
@@ -229,6 +532,20 @@ async function fetchProfile(apiBaseUrl) {
   if (!response.ok) {
     throw new Error(`Profile fetch failed (${response.status})`);
   }
+  return response.json();
+}
+
+async function fetchAiAnswers(apiBaseUrl, payload) {
+  const response = await fetch(`${apiBaseUrl}/ai/answer-fields`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    throw new Error(`AI answer request failed (${response.status})`);
+  }
+
   return response.json();
 }
 
@@ -252,20 +569,19 @@ const greenhouseAdapter = {
   },
 
   extract_fields() {
-    return getFillableInputs();
+    return extractFieldCandidates();
   },
 
-  map_fields(input) {
-    const haystack = getCandidateText(input);
+  map_fields(candidate) {
+    const haystack = normalize(`${candidate.labelText} ${candidate.id}`);
     return mapFieldFromText(haystack);
   },
 
-  fill(input, value) {
-    return fillInput(input, value);
+  fill(candidate, value) {
+    return fillCandidate(candidate, value);
   },
 
   upload_resume() {
-    // Not in MVP. Resume upload can be added after basic fill quality is stable.
     return { status: "not-implemented" };
   }
 };
@@ -289,6 +605,8 @@ async function runAutofill(apiBaseUrl) {
   const skipped = [];
   const lowConfidence = [];
   const missingValues = [];
+  const handledIds = new Set();
+  const blockedForAiIds = new Set();
 
   for (const field of fields) {
     const match = adapter.map_fields(field);
@@ -297,9 +615,10 @@ async function runAutofill(apiBaseUrl) {
     }
 
     if (match.confidence < LOW_CONFIDENCE_THRESHOLD) {
-      field.classList.add("job-copilot-low-confidence");
+      blockedForAiIds.add(field.id);
+      highlightCandidate(field);
       lowConfidence.push({ key: match.key, label: match.labelText, confidence: match.confidence });
-      skipped.push({ key: match.key, reason: "low-confidence" });
+      skipped.push({ key: match.key, reason: "low-confidence-rule" });
       continue;
     }
 
@@ -312,20 +631,83 @@ async function runAutofill(apiBaseUrl) {
 
     const fillResult = adapter.fill(field, value);
     if (fillResult.status === "filled") {
-      filled.push({ key: match.key, label: match.labelText });
+      handledIds.add(field.id);
+      filled.push({ key: match.key, source: "rule" });
     } else {
+      if (fillResult.status === "already-populated" || fillResult.status === "not-editable") {
+        handledIds.add(field.id);
+      }
       skipped.push({ key: match.key, reason: fillResult.status });
     }
   }
 
+  const aiCandidates = fields.filter(
+    (field) => !handledIds.has(field.id) && !blockedForAiIds.has(field.id) && !isCandidateFilled(field)
+  );
+  let aiResult = { answers: [], used_llm: false, model: "", message: "" };
+
+  if (aiCandidates.length > 0) {
+    const payload = {
+      site: adapter.id,
+      job_url: window.location.href,
+      job_title: extractJobTitle(),
+      company: extractCompanyName(),
+      job_description: extractJobDescriptionText(),
+      fields: aiCandidates.map((field) => ({
+        field_id: field.id,
+        label: field.labelText,
+        field_type: field.fieldType,
+        required: field.required,
+        options: field.options,
+        current_value: getCurrentCandidateValue(field)
+      }))
+    };
+
+    try {
+      aiResult = await fetchAiAnswers(apiBaseUrl, payload);
+    } catch (error) {
+      skipped.push({ key: "ai", reason: `ai-request-failed:${error.message || String(error)}` });
+    }
+  }
+
+  const aiAnswerMap = new Map((aiResult.answers || []).map((answer) => [answer.field_id, answer]));
+
+  for (const field of aiCandidates) {
+    const answer = aiAnswerMap.get(field.id);
+    if (!answer) {
+      continue;
+    }
+
+    const confidence = Number(answer.confidence || 0);
+    if (confidence < AI_FILL_CONFIDENCE_THRESHOLD) {
+      highlightCandidate(field);
+      lowConfidence.push({ key: field.id, label: field.labelText, confidence });
+      skipped.push({ key: field.id, reason: "low-confidence-ai" });
+      continue;
+    }
+
+    const fillResult = adapter.fill(field, answer.value);
+    if (fillResult.status === "filled") {
+      filled.push({ key: field.id, source: "ai" });
+    } else {
+      skipped.push({ key: field.id, reason: `ai-${fillResult.status}` });
+    }
+  }
+
+  const filledRuleCount = filled.filter((item) => item.source === "rule").length;
+  const filledAiCount = filled.filter((item) => item.source === "ai").length;
+
   const summary = {
     ok: true,
     site: adapter.id,
+    filledRuleCount,
+    filledAiCount,
     filledCount: filled.length,
     skippedCount: skipped.length,
     lowConfidenceCount: lowConfidence.length,
     missingValues: Array.from(new Set(missingValues)),
-    message: "Autofill complete. Review all fields before submitting."
+    message: "Autofill complete. Review all fields before submitting.",
+    aiMessage: aiResult.message || ""
   };
 
   renderSummary(summary);
@@ -333,12 +715,17 @@ async function runAutofill(apiBaseUrl) {
   await emitAudit(apiBaseUrl, {
     site: adapter.id,
     job_url: window.location.href,
-    filled_fields: filled.map((item) => item.key),
+    filled_fields: filled.map((item) => `${item.key}:${item.source}`),
     skipped_fields: skipped.map((item) => `${item.key}:${item.reason}`),
     metadata: {
       filled_count: summary.filledCount,
+      filled_rule_count: summary.filledRuleCount,
+      filled_ai_count: summary.filledAiCount,
       skipped_count: summary.skippedCount,
-      low_confidence_count: summary.lowConfidenceCount
+      low_confidence_count: summary.lowConfidenceCount,
+      ai_used: Boolean(aiResult.used_llm),
+      ai_model: aiResult.model || "",
+      ai_message: summary.aiMessage
     }
   });
 

@@ -20,6 +20,7 @@ Endpoints implemented:
 - `PUT /profile`
 - `POST /documents/resume` (returns mock signed URL + file id)
 - `POST /events/audit`
+- `POST /ai/answer-fields` (LLM + heuristic answers for custom questions)
 - `POST /jobs/save`
 - `GET /jobs/save`
 - `POST /jobs/applied`
@@ -48,6 +49,20 @@ Safety behavior:
 - Skips low-confidence matches
 - Shows in-page summary panel (filled/skipped/missing)
 - Sends audit log to backend
+
+LLM-assisted behavior:
+- Deterministic fill first (name/email/phone/linkedin)
+- Then asks backend AI endpoint for unknown/custom fields (text/select/radio/checkbox/textarea)
+- Fills only high-confidence AI answers and highlights low-confidence fields for manual review
+
+To enable OpenAI answers, set env vars before starting backend:
+
+```bash
+export OPENAI_API_KEY="your_key_here"
+export OPENAI_MODEL="gpt-4.1-mini"  # optional
+```
+
+If `OPENAI_API_KEY` is not set, backend falls back to heuristic answers only.
 
 ## 4) Quick validation target
 

@@ -56,12 +56,15 @@ autofillButton.addEventListener("click", async () => {
 
     const summary = [
       `Site: ${result.site || "unknown"}`,
+      `Rule Filled: ${result.filledRuleCount || 0}`,
+      `AI Filled: ${result.filledAiCount || 0}`,
       `Filled: ${result.filledCount || 0}`,
       `Skipped: ${result.skippedCount || 0}`,
-      result.message || "Done. Review values before submitting."
+      result.message || "Done. Review values before submitting.",
+      result.aiMessage ? `AI Note: ${result.aiMessage}` : ""
     ];
 
-    setStatus(summary.join("\n"));
+    setStatus(summary.filter(Boolean).join("\n"));
   } catch (error) {
     setStatus(`Unexpected error:\n${error.message || String(error)}`);
   } finally {
