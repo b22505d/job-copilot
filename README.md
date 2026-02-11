@@ -63,3 +63,42 @@ Add a Lever adapter with the same interface:
 - `map_fields()`
 - `fill()`
 - `upload_resume()`
+
+## 6) Deploy backend on AWS App Runner
+
+Use the Dockerfile at `backend/Dockerfile`.
+
+1. In AWS Console, open **App Runner** and click **Create service**.
+2. Source and deployment:
+- Source type: **Source code repository**
+- Provider: **GitHub**
+- Repository: `b22505d/job-copilot`
+- Branch: `main`
+- Deployment trigger: **Automatic** (or Manual if you prefer)
+3. Build settings:
+- Configuration: **Use a Dockerfile**
+- Source directory: `backend`
+4. Service settings:
+- Port: `8000`
+- CPU/Memory: start with defaults
+- Environment variables: none required for MVP
+5. Create service and wait until status is **Running**.
+6. Open the default App Runner URL and verify:
+- `https://<your-app-runner-url>/health` should return `{"status":"ok"}`
+
+## 7) Connect `api.jobgenflow.com` to App Runner
+
+1. In your App Runner service, open **Custom domains** and add `api.jobgenflow.com`.
+2. App Runner shows DNS records (target + certificate validation CNAME records).
+3. In Network Solutions DNS for `jobgenflow.com`, add exactly those CNAME records.
+4. Wait until App Runner custom domain status is **Active**.
+5. Verify:
+- `https://api.jobgenflow.com/health`
+
+## 8) Point extension to production API
+
+Update:
+- `extension/manifest.json` -> add `https://api.jobgenflow.com/*` to `host_permissions`
+- `extension/popup.js` -> set `DEFAULT_API_BASE_URL` to `https://api.jobgenflow.com`
+
+Then reload extension in `chrome://extensions`.
